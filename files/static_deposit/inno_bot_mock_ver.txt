@@ -1,0 +1,326 @@
+# create_bot.py
+import os
+
+import colorlog
+
+from aiogram import Bot
+from aiogram import Dispatcher
+
+from database.db_req import Database
+
+token_tg = os.environ.get('TOKEN_TG')
+bot = Bot(token=token_tg)
+dp = Dispatcher()
+
+database_req = Database()
+# После проработки интерфейса добавления фраз необходимо изменить глобальную переменную
+# В идеале вынести переменную в redis
+all_prases_to_parse = database_req.get_all_parse_phrases_dict()
+
+
+
+# create_logger.py
+import logging
+import colorlog
+
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = colorlog.ColoredFormatter(
+    '%(log_color)s%(levelname)s:%(name)s:%(message)s',
+    log_colors={
+        'DEBUG': 'cyan',
+        'INFO': 'green',
+        'WARNING': 'yellow',
+        'ERROR': 'red',
+        'CRITICAL': 'red,bg_white'
+    }
+)
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+
+
+# main.py
+from create_bot import bot
+
+from misc.utils import set_default_commands
+from create_bot import dp
+import asyncio
+
+
+async def on_startup(_):
+    """
+    Запуск бота
+    """
+    asyncio.create_task(set_default_commands(dp))
+    print('Бот запущен')
+
+
+async def on_shutdown(_):
+    """
+    Завершение работы
+    """
+    print('Бот отключен')
+
+
+from handlers import client, admin, other
+
+admin.register_handlers_admin(dp)
+client.register_handlers_client(dp)
+other.register_handlers_other(dp)
+
+
+async def main():
+    await dp.start_polling(bot)
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
+
+
+
+# database.models.py
+from datetime import datetime
+from typing import Any
+
+import sqlalchemy as sq
+from sqlalchemy import Column
+from sqlalchemy.orm import declarative_base, relationship, mapped_column
+
+Base = declarative_base()
+
+
+class User(Base):
+    """
+    Пользователи бота.
+    """
+    __tablename__ = 'User'
+
+    id = Column(sq.Integer, primary_key=True, autoincrement=True)
+    tg_id = Column(sq.BIGINT)
+    name = Column(sq.String(255), nullable=False)
+    email = Column(sq.String(255), nullable=False)
+
+
+class AdminGroup(Base):
+    """
+    Телеграм группа администраторов.
+    """
+    __tablename__ = 'AdminGroup'
+
+    id = Column(sq.Integer, primary_key=True, autoincrement=True)
+    tg_id = Column(sq.BIGINT)
+    owner = Column(sq.Integer, sq.ForeignKey("User.id"), nullable=False)
+
+
+class UserGroup(Base):
+    """
+    Группы пользователей.
+    """
+    __tablename__ = 'UserGroup'
+
+    id = Column(sq.Integer, primary_key=True, autoincrement=True)
+    name = Column(sq.String(255))
+    tg_user = Column(sq.ForeignKey("User.id"), nullable=False)
+    tg_group = Column(sq.ForeignKey("AdminGroup.id"), nullable=False)
+
+
+class ParseGroup(Base):
+    """
+    Список групп для парсинга сообщений.
+    """
+    __tablename__ = 'ParseGroup'
+
+    id = Column(sq.Integer, primary_key=True, autoincrement=True)
+    tg_id = Column(sq.BIGINT)
+    owner = Column(sq.Integer, sq.ForeignKey("User.id"))
+
+
+class ParsePhrase(Base):
+    """
+    Фразы или слова для парсинга.
+    """
+    __tablename__ = 'ParsePhrase'
+
+    id = Column(sq.Integer, primary_key=True, autoincrement=True)
+    text = Column(sq.String(255))
+    owner = Column(sq.Integer, sq.ForeignKey("User.id"))
+
+
+class PhrasesForGroups(Base):
+    """
+    m2m для соединения фраз для парсинга и групп в которых парсинг происходит
+    """
+    __tablename__ = 'PhrasesForGroups'
+
+    id = sq.Column(sq.Integer, primary_key=True)
+    phrase = sq.Column(sq.Integer, sq.ForeignKey("ParsePhrase.id"))
+    group = sq.Column(sq.Integer, sq.ForeignKey("ParseGroup.id"))
+
+    parse_phrase = relationship(ParsePhrase, backref="phrase")
+    parse_group = relationship(ParseGroup, backref="group")
+
+
+
+# database.db_req.py
+import os
+
+import sqlalchemy
+from sqlalchemy import extract
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.exc import IntegrityError
+
+from create_logger import logger
+from database.models import *
+
+
+class Database:
+    def __init__(self):
+        DSN = os.environ.get("INNO_TALENT_BOT_DB_DSN")
+        self.engine = sqlalchemy.create_engine(DSN)
+        Session = sessionmaker(bind=self.engine)
+        self.session = Session()
+
+    def create_tables(self):
+        Base.metadata.create_all(self.engine)
+        logger.info('Таблицы созданы согласно models.py')
+
+    def drop_tables(self):
+        Base.metadata.drop_all(self.engine)
+        logger.info('Все таблицы удалены, все пропало !!!')
+
+    def get_all_parse_phrases_dict(self) -> dict:
+        """
+        Возвращает словарь групп и их фраз.
+        """
+        result = {}
+        for i in self.session.query(PhrasesForGroups).all():
+            result.setdefault(i.group.tg_id, []).append(i.phrase.text)
+        return result
+
+    def get_all_parse_phrases_for_group(self, group_tg_id: int) -> [str]:
+        """
+        Получить список фраз для парсинга по group_tg_id.
+        """
+        all_phrases = self.session.query(PhrasesForGroups).filter(PhrasesForGroups.group.tg_id == group_tg_id).all()
+        return [phrase.phrase.text for phrase in all_phrases]
+
+    def get_admin_groups_to_send_notification_by_parse_group_id(self, tg_group_id: int) -> [int]:
+        """
+        Получить список всех tg_id групп для отправки оповещения о совпадении.
+        :tg_group_id: tg_id группы, где найдено совпадение
+        """
+        owner = self.session.query(ParseGroup).filter(ParseGroup.tgroup_id == tg_group_id).owner
+        all_admins_groups = self.session.query(UserGroup).filter(UserGroup.tg_user == owner.id).all()
+        return [group.tg_group.tg_id for group in all_admins_groups]
+
+
+
+# handlers.admin.py
+from aiogram import Dispatcher
+
+
+def register_handlers_admin(dp: Dispatcher):
+    pass
+
+
+
+# handlers.client.py
+from aiogram import Dispatcher, types
+from aiogram.filters import Command
+from create_bot import dp, all_prases_to_parse, bot, database_req
+from templates.message_templates import match_found_notification
+
+
+# @dp.message(Command('start'))
+async def start(msg: types.Message):
+    # Регистрация пользователя
+    ...
+
+
+@dp.message()
+async def parse_message(msg: types.Message):
+    # Только для групп, супергрупп и сообществ
+    if msg.from_user.id != msg.chat.id:
+        if not msg.chat.id in all_prases_to_parse.keys():
+            return
+        text = msg.text
+        # Есть смысл не смотреть прямое соответствие, а обозначить поправку используя расстояние Левенштейна
+        if any(all_prases_to_parse[msg.chat.id] in text):
+            group_to_send_notification = database_req.get_admin_groups_to_send_notification_by_parse_group_id(
+                msg.chat.id)
+            for group in group_to_send_notification:
+                text = match_found_notification.format(
+                    group_name=msg.chat.name,
+                    found_user_tg_name=msg.from_user.username,
+                    message_text=msg.text
+                )
+                await bot.send_message(
+                    chat_id=group,
+                    text=text
+                )
+
+
+def register_handlers_client(dp: Dispatcher):
+    dp.message.register(start, Command('start'))
+
+
+
+
+# handlers.other.py
+from aiogram import Dispatcher
+
+
+def register_handlers_other(dp: Dispatcher):
+    pass
+
+
+
+misc.utils.py
+from aiogram import types
+
+
+async def set_default_commands(dp):
+    await dp.bot.set_my_commands([
+        types.BotCommand("start", "Start dialogue"),
+    ])
+
+
+
+templates.message_templates.py
+"""
+Шаблоны сообщений
+"""
+
+
+# Можно добавить HTML или MD разметку для красивого вывода
+# При добавлении надо внести изменения в формирование сообщения из шаблона
+match_found_notification = 'Найдено совпадение в группе {group_name}\n\n' \
+                           'Пользователь: {found_user_tg_name}\n' \
+                           'Сообщение: {message_text}'
+
+
+
+# requirements.txt
+aiofiles==23.2.1
+aiogram==3.7.0
+aiohttp==3.9.5
+aiosignal==1.3.1
+annotated-types==0.7.0
+async-timeout==4.0.3
+attrs==23.2.0
+certifi==2024.6.2
+colorama==0.4.6
+colorlog==6.8.2
+frozenlist==1.4.1
+greenlet==3.0.3
+idna==3.7
+magic-filter==1.0.12
+multidict==6.0.5
+pydantic==2.7.3
+pydantic_core==2.18.4
+SQLAlchemy==2.0.30
+typing_extensions==4.12.1
+yarl==1.9.4
