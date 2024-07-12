@@ -1,10 +1,7 @@
-FROM python:3.8-alpine
+FROM python:3.9-alpine
 
 ENV PYTHONDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
-
-# Изменение зеркала
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/' /etc/apk/repositories
 
 # Обновление и установка зависимостей
 RUN apk update && apk add postgresql-dev gcc python3-dev musl-dev libffi-dev
